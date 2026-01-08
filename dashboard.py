@@ -1,20 +1,16 @@
 import streamlit as st
-import boto3
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import json
 import os
-import numpy as np
 import time
-import requests
-import logging
-import graphviz
 import platform
-from sklearn.linear_model import Ridge
-from datetime import datetime, timedelta
-from graphviz import Digraph
-from pathlib import Path
+from datetime import datetime
+
+# --- IMPORT UTILS ---
+from utils.styles import apply_styles, therm_icon, hum_icon, batt_icon, sig_icon, time_icon, motion_icon
+from utils.data import load_data_from_s3, load_data_from_csv
+from utils.ml import run_ml_prediction, check_api_health
 
 if platform.system() == "Windows":
     # dot.exe path
@@ -31,209 +27,24 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # --- SETTINGS & STYLING ---
 st.set_page_config(page_title="Group C: Environment Sensor Dashboard", page_icon="🌡️", layout="wide", initial_sidebar_state="expanded")
 
-# Custom CSS for better aesthetics
-st.markdown("""
-<style>
-    .card {padding: 20px; border-radius: 14px; box-shadow: 0px 3px 8px rgba(0,0,0,0.1); text-align: left; margin: 10px 0px; }
-    .card-temp {background-color: #e8f5e9;}
-    .card-hum {background-color: #e3f2fd;}
-    .card-motion {background-color: #fff3e0;}
-    .card-battery {background-color: #f1f8e9;}
-    .metric-value {font-size: 28px; font-weight: bold; margin: 5px 0px; color: #2e7d32; }
-    .metric-label {font-size: 14px; color: #555; }
-    .icon {width: 26px; height: 26px; vertical-align: middle; margin-right: 8px; }
-    .status-good {color: #4caf50; }
-    .status-warning { color: #ff9800; }
+apply_styles()
 
-</style>
-""", unsafe_allow_html=True)
-
-# --- SVG ICONS ---
-therm_icon = """<svg xmlns"http://www.w3.org/2000/svg" fill="#e53935" class="icon" viewBox="0 0 24 24"><path d="M14 14.76V5a2 2 0 10-4 0v9.76a5 5 0 104 0z"/></svg>"""
-hum_icon = """<svg xmlns="http://www.w3.org/2000/svg" fill="#1e88e5" class="icon" viewBox="0 0 24 24"><path d="M12 2.69L17.66 9a7 7 0 11-11.32 0L12 2.69z"/></svg>"""
-batt_icon = """<svg xmlns="http://www.w3.org/2000/svg" fill="#4caf50" class="icon" viewBox="0 0 24 24"><path d="M15.67 4H14V2h-4v2H8.33C7.6 4 7 4.6 7 5.33v15.33C7 21.4 7.6 22 8.33 22h7.33c.74 0 .74-.6 .74-1.33V5.33C17 .6 .6 .6 .6 .6V5.33C-.8 .8 -8 -8 -8 -8z"/></svg>"""
-sig_icon = """<svg xmlns="http://www.w3.org/2000/svg" fill="#ff9800" class="icon" viewBox="0 0 24 24"><path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.07 2.93 1 9z"/></svg>"""
-time_icon = """<svg xmlns="http://www.w3.org/2000/svg" fill="#ffb300" class="icon" viewBox="0 0 24 24"><path d="M12 1a11 11 0 1011 11A11.013 11.013 0 0012 1zm0 20a9 9 0 119-9 9.01 9.01 0 01-9 9zm.5-13h-1v6l5.25 3.15.5-.86-4.75-2.79z"/></svg>"""
-
-
-# --- APIs ---
-API_URL = "https://temperature-prediction-api.onrender.com/api"
-
-try:
-    BUCKET_NAME = st.secrets.get("BUCKET_NAME", "iot-amzn-bucket")
-    AWS_REGION = st.secrets.get("AWS_REGION", "us-east-1")
-    AWS_SECRET_ACCESS_KEY = st.secrets["AWS_SECRET_ACCESS_KEY"]
-    AWS_ACCESS_KEY_ID = st.secrets["AWS_ACCESS_KEY_ID"]
-    
-    # Initialize s3
-    s3 = boto3.client(
-        's3',
-        aws_access_key_id=st.secrets["AWS_ACCESS_KEY_ID"],
-        aws_secret_access_key=st.secrets["AWS_SECRET_ACCESS_KEY"],
-        region_name=AWS_REGION
-    )
-except Exception as e:
-    st.error(f"Setup Error: {e}")
-    st.stop()
-    
-print(f"--- 🔍 S3 Debugger Started ---")
-
-try:
-    # Test connection
-    print(f"Testing connection to {BUCKET_NAME} in {AWS_REGION}...")
-    s3.head_bucket(Bucket=BUCKET_NAME)
-    print("✅ Connection Successful!")
-
-    # Check for your specific file
-    print(f"Looking for: sensor_ml_data.csv")
-    response = s3.list_objects_v2(Bucket=BUCKET_NAME, Prefix='sensor_ml_data.csv')
-    
-    if 'Contents' in response:
-        print(f"✅ Found File: {response['Contents'][0]['Key']}")
-    else:
-        print("❌ File NOT FOUND. Please upload sensor_ml_data.csv to the bucket.")
-
-except Exception as e:
-    print(f"❌ Error: {e}")
-    print("💡 Tip: Ensure your IAM user has 'AmazonS3FullAccess' and your bucket name is correct.")
-
-# --- S3 DATA LOADING ENGINE ---    
-@st.cache_resource
-def get_s3_client():
-    return boto3.client('s3', aws_access_key_id=AWS_ACCESS_KEY_ID, aws_secret_access_key=AWS_SECRET_ACCESS_KEY, region_name=AWS_REGION)
-
-@st.cache_data(ttl=300)
-def load_data_from_s3():
-    s3_client = get_s3_client()
-    file_key = "sensor_ml_data.csv" 
-    
-    try:
-        # Fetch the specific CSV file
-        resp = s3_client.get_object(Bucket=BUCKET_NAME, Key=file_key)
-        df = pd.read_csv(resp['Body'])
-        
-        # Standardize column names for your dashboard
-        df.columns = df.columns.str.strip().str.lower()
-        
-        # Handle the timestamp (Using Uganda time as per your CSV logic)
-        if 'timestamp_uganda' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp_uganda'])
-        else:
-            df['timestamp'] = pd.to_datetime(df['timestamp_utc'])
-            
-        return df.sort_values("timestamp")
-    
-    except Exception as e:
-        logging.warning(f"S3 CSV Load failed: {e}")
-        return pd.DataFrame()
-
-def check_api_health():
-    try:
-        response = requests.get(f"{API_URL}/health", timeout=15)
-        return response.json() if response.status_code == 200 else None
-    except: return None
-    
-
-# --- DATA LOAD ENGINE ---   
-@st.cache_data
-def load_data_from_csv(
-    filename="sensor_ml_data.csv"
-):    
-    current_dir = Path(__file__).parent.absolute()
-    file_path = current_dir / "dataset" / filename
-    
-    # DEBUG: This will print the EXACT path in your terminal
-    print(f"--- 📂 Searching for CSV at: {file_path} ---")
-    
-    if not file_path.exists():
-        st.error(f"CSV file '{file_path}' not found.")
-        return pd.DataFrame()
-    
-    try:
-        df = pd.read_csv(file_path)
-
-        # Use Uganda time if available, otherwise UTC
-        if 'timestamp_uganda' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp_uganda'])
-        else:
-            df['timestamp'] = pd.to_datetime(df['timestamp_utc'])
-
-        # Keep only columns the dashboard needs
-        df = df[[
-            'timestamp',
-            'temperature_celsius',
-            'humidity_percent',
-            'battery_voltage',
-            'motion_counts',
-            'rssi'
-        ]]
-
-        # Sort for time-series logic
-        df = df.sort_values('timestamp').dropna()
-
-        return df
-
-    except Exception as e:
-        st.error(f"CSV Load Error: {e}")
-        return pd.DataFrame()
-    
-# --- ANALYTICS ENGINE ---
-def get_battery_stats(df):
-    if df.empty or 'Battery' not in df.columns:
-        return 0.0, 0
-    
-    latest_v = df['Battery'].iloc[0]
-    # Simple linear drain estimate
-    subset = df.head(20)
-    if len(subset) > 1:
-        m, b = np.polyfit(range(len(subset)), subset['Battery'], 1)
-        # Using 2.8V as the "Dead" threshold
-        days_left = round((latest_v - 2.8) / abs(m * 24) if m < 0 else 99, 1)
-    else:
-        days_left = "Calculating..."
-    return latest_v, days_left
-
-def run_ml_prediction(df):
-    
-    df = df.copy()
-    df.columns = df.columns.str.strip().str.lower()
-    
-    if 'timestamp' not in df.columns:
-        return {"success": False, "error": "Timestamp column missing."}
-    
-    if len(df) < 10: 
-        return {"success": False, "error": "Not enough data for prediction."}
-
-    df_ml = df.sort_values("timestamp").copy()
-    df_ml['temp_lag1'] = df_ml['temperature_celsius'].shift(1)
-    df_ml['temp_lag2'] = df_ml['temperature_celsius'].shift(2)
-    df_ml = df_ml.dropna()
-    
-    X = df_ml[['temp_lag1', 'temp_lag2', 'humidity_percent']]
-    y = df_ml['temperature_celsius']
-
-    model = Ridge(alpha=1.0)
-    model.fit(X, y)
-    
-    # Predict based on the very last known values
-    last_row = df_ml.iloc[-1]
-    prediction = model.predict([[last_row['temperature_celsius'], last_row['temp_lag1'], last_row['humidity_percent']]])
-    
-    return {
-        "success": True,
-        "prediction": {
-            "temperature_celsius": round(prediction[0], 2),
-            "confidence": "±0.5°C (estimated MAE)"
-        }
-    }
     
 # --- MAIN DASHBOARD LOGIC ---
 def main():
     
     st.markdown("<h1 style='color:#2e7d32;'>🌱 IoT Environmental Monitoring Dashboard</h1>", unsafe_allow_html=True) 
     st.markdown("Real-time telemetry with AI-powered insights.")
+    
+    # Automatically refresh the dashboard every 10 minutes (600 seconds)
+    st.empty() 
+    if "last_refresh" not in st.session_state:
+        st.session_state.last_refresh = time.time()
+    
+    # This keeps the app updated without a full page reload
+    st.cache_data.clear() # Optional: clears cache to ensure fresh S3 data
 
-# 1. First, try to get data from AWS S3
+    # 1. First, try to get data from AWS S3
     df = load_data_from_s3()
 
     # 2. If S3 is empty, try to load the local file as a backup
@@ -245,16 +56,7 @@ def main():
     if df.empty:
         st.error("⚠️ No telemetry data available from S3 or local CSV.")
         return    
-        
-    # df = df.rename(columns={
-    #     "Timestamp": "timestamp",
-    #     "Temperature": "temperature_celsius",
-    #     "Humidity": "humidity_percent",
-    #     "Battery": "battery_voltage",
-    #     "Motion": "motion_counts",
-    #     "Signal": "rssi"
-    # })
-
+    
     # If your CSV columns are already 'temperature_celsius', just ensure 'timestamp' exists
     if 'timestamp' not in df.columns:
         st.error("Timestamp column missing from S3 data")
@@ -262,7 +64,22 @@ def main():
     # 4. If we found data, show the latest reading
     latest = df.iloc[-1] 
     
+    
+# --- COMFORT ZONE LOGIC ---
+    temp_now = latest['temperature_celsius']
+    hum_now = latest['humidity_percent']
+
+    if 20 <= temp_now <= 26 and 30 <= hum_now <= 60:
+        st.success("✅ **Status: Optimal.** The environment is within the healthy comfort zone.")
+    elif temp_now > 26:
+        st.warning("⚠️ **Status: High Temperature.** Cooling may be required.")
+    elif temp_now < 20:
+        st.info("❄️ **Status: Low Temperature.** Heating may be required.")
+    else:
+        st.warning("💧 **Status: Humidity Alert.** Air may be too dry or too damp.")
+        
     st.caption(f"Last sync: {latest['timestamp'].strftime('%Y-%m-%d %H:%M:%S')} (Uganda Time)")
+    
     
 # --- TOP ROW: CUSTOM CARDS ---    
     # Display latest metrics
@@ -273,16 +90,49 @@ def main():
     m2.markdown(f'<div class="card card-temp">{therm_icon}<span class="metric-label">Temp</span><div class="metric-value">{latest["temperature_celsius"]:.1f}°C</div></div>', unsafe_allow_html=True)
     m3.markdown(f'<div class="card card-hum">{hum_icon}<span class="metric-label">Humidity</span><div class="metric-value">{latest["humidity_percent"]:.1f}%</div></div>', unsafe_allow_html=True)
     m4.markdown(f'<div class="card card-battery">{batt_icon}<span class="metric-label">Battery</span><div class="metric-value">{latest.get("battery_voltage",0):.2f}V</div></div>', unsafe_allow_html=True)
-    m5.markdown(f'<div class="card card-motion">{"" if latest.get("motion_counts",0) > 0 else ""}<span class="metric-label">Motion</span><div class="metric-value">{latest.get("motion_counts",0)} counts</div></div>', unsafe_allow_html=True)
+    m5.markdown(f'<div class="card card-motion">{motion_icon}<span class="metric-label">Motion</span><div class="metric-value">{latest.get("motion_counts",0)} counts</div></div>', unsafe_allow_html=True)
     m6.markdown(f'<div class="card card-signal">{sig_icon}<span class="metric-label">RSSI</span><div class="metric-value">{latest.get("rssi",-100)} dBm</div></div>', unsafe_allow_html=True)
 
     st.divider()
     
-    # Show the chart
-    st.line_chart(df.set_index('timestamp')['temperature_celsius'])
+    
+# --- VISUAL ANALYTICS ROW ---
+    col_gauge, col_trend = st.columns([1, 1])
+
+    with col_gauge:
+        # --- TEMPERATURE GAUGE ---
+        fig_gauge = go.Figure(go.Indicator(
+            mode = "gauge+number",
+            value = latest['temperature_celsius'],
+            title = {'text': "Current Temperature (°C)"},
+            gauge = {
+                'axis': {'range': [None, 50]},
+                'bar': {'color': "#2e7d32"},
+                'steps': [
+                    {'range': [0, 20], 'color': "#a5d6a7"},
+                    {'range': [20, 30], 'color': "#fff59d"},
+                    {'range': [30, 50], 'color': "#ef9a9a"}
+                ],
+                'threshold': {
+                    'line': {'color': "red", 'width': 4},
+                    'thickness': 0.75,
+                    'value': 35
+                }
+            }
+        ))
+        fig_gauge.update_layout(height=350, margin=dict(l=20, r=20, t=50, b=20))
+        st.plotly_chart(fig_gauge, width="stretch", key="temp_gauge")
+
+    with col_trend:
+        # --- LINE CHART ---
+        st.markdown("### 📈 Temperature Trend")
+        # Setting height to match the gauge
+        st.line_chart(df.set_index('timestamp')['temperature_celsius'], height=350)  
+        
+    st.divider()
+
 
 # --MIDDLE ROW: AI PREDICTION ---
-    st.divider()
     st.markdown("🔮 AI Temperature Forecast")
     st.info("The AI service analyzes rolling averages and temporal lags to forecast trends.")
     
@@ -303,7 +153,8 @@ def main():
             else:
                 st.error("Prediction service timed out. Please try again in 15 seconds.")                    
 
-# Charts
+
+# ---TRENDS ---
     st.markdown("## 📊 Trends")
     tab_motion, tab_signal, tab_battery, tab_corr = st.tabs(["🏃 Motion", "📶 Signal", "🔋 Battery", "🔍 Insights & Correlations"])
     with tab_motion:
@@ -413,7 +264,7 @@ def main():
         4. **Analytics:** Streamlit applies Ridge Regression for prediction.
         """)   
 
-        # Create a new directed graph
+        # System Architecture Diagram
 
         st.graphviz_chart('''
         digraph G {
@@ -469,8 +320,14 @@ def main():
         
         st.caption("System architecture illustrating data flow from sensing to analytics.")
     
-    # Sidebar info
+# --- SIDEBAR ---
     with st.sidebar:
+        
+        # ... Refresh button via the sidebar
+        if st.button("🔄 Refresh"):
+            st.cache_data.clear()
+            st.rerun()
+            
         st.header("🏗️ System Architecture")
         st.info("**Layer 1:** Dragino LHT65N (LoRaWAN)\n\n**Layer 2:** TTN Community Network\n\n**Layer 3:** Streamlit Data Engine\n\n**Layer 4:** Ridge Regression ML")
         st.divider()
@@ -487,10 +344,13 @@ def main():
             
         if health:
             st.success("API Online")
-            st.caption(f"Model: {health.get('model_type')}")
+            st.caption(f"Model: {health.get('model_type', 'Ridge Regression')} | Uptime: {health.get('uptime', 'N/A')}s")
         else:
             st.warning("API Sleeping")
-            if st.button("Wake Up API"): requests.get(f"{API_URL}/health"); st.rerun()
+
+            if st.button("💤 Wake Up API"):
+                check_api_health()
+                st.rerun()
 
 if __name__ == "__main__":
     main()  
