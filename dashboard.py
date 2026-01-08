@@ -60,39 +60,42 @@ time_icon = """<svg xmlns="http://www.w3.org/2000/svg" fill="#ffb300" class="ico
 API_URL = "https://temperature-prediction-api.onrender.com/api"
 
 try:
-    BUCKET_NAME = st.secrets.get("BUCKET_NAME", "iotbucket256")
-    DEVICE_ID = st.secrets.get("DEVICE_ID", "lht65n-01-temp-humidity-sensor")
-    AWS_ACCESS_KEY_ID = st.secrets["AWS_ACCESS_KEY_ID"]
+    BUCKET_NAME = st.secrets.get("BUCKET_NAME", "iot-amzn-bucket")
+    AWS_REGION = st.secrets.get("AWS_REGION", "us-east-1")
     AWS_SECRET_ACCESS_KEY = st.secrets["AWS_SECRET_ACCESS_KEY"]
-    AWS_REGION = st.secrets.get("AWS_REGION", "eu-west-1")
-except KeyError as e:
-    st.error(f"⚠️ Missing secret: {e}")
+    AWS_ACCESS_KEY_ID = st.secrets["AWS_ACCESS_KEY_ID"]
+    
+    # Initialize s3
+    s3 = boto3.client(
+        's3',
+        aws_access_key_id=st.secrets["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=st.secrets["AWS_SECRET_ACCESS_KEY"],
+        region_name=AWS_REGION
+    )
+except Exception as e:
+    st.error(f"Setup Error: {e}")
     st.stop()
     
 print(f"--- 🔍 S3 Debugger Started ---")
-print(f"Checking Bucket: {BUCKET_NAME}, Device: {DEVICE_ID}")
-
-# Initialize S3
-s3 = boto3.client('s3', aws_access_key_id=AWS_ACCESS_KEY_ID, aws_secret_access_key=AWS_SECRET_ACCESS_KEY, region_name=AWS_REGION)
 
 try:
-    # 1. Test Connection
-    print("Testing connection...")
+    # Test connection
+    print(f"Testing connection to {BUCKET_NAME} in {AWS_REGION}...")
     s3.head_bucket(Bucket=BUCKET_NAME)
-    print("✅ Successfully connected to bucket!")
+    print("✅ Connection Successful!")
 
-    # 2. List ALL objects (unfiltered)
-    print("\nListing first 10 files in the bucket:")
-    response = s3.list_objects_v2(Bucket=BUCKET_NAME, MaxKeys=10)
+    # Check for your specific file
+    print(f"Looking for: sensor_ml_data.csv")
+    response = s3.list_objects_v2(Bucket=BUCKET_NAME, Prefix='sensor_ml_data.csv')
     
     if 'Contents' in response:
-        for obj in response['Contents']:
-            print(f"Found File: {obj['Key']} (Size: {obj['Size']} bytes)")
+        print(f"✅ Found File: {response['Contents'][0]['Key']}")
     else:
-        print("❌ The bucket is completely empty.")
+        print("❌ File NOT FOUND. Please upload sensor_ml_data.csv to the bucket.")
 
 except Exception as e:
     print(f"❌ Error: {e}")
+    print("💡 Tip: Ensure your IAM user has 'AmazonS3FullAccess' and your bucket name is correct.")
 
 # --- S3 DATA LOADING ENGINE ---    
 @st.cache_resource
@@ -100,49 +103,28 @@ def get_s3_client():
     return boto3.client('s3', aws_access_key_id=AWS_ACCESS_KEY_ID, aws_secret_access_key=AWS_SECRET_ACCESS_KEY, region_name=AWS_REGION)
 
 @st.cache_data(ttl=300)
-def load_data_from_s3(days_back=7):
+def load_data_from_s3():
     s3_client = get_s3_client()
-    prefix = f"processed_data/{DEVICE_ID}/"
-    all_records = []
+    file_key = "sensor_ml_data.csv" 
     
     try:
-        paginator = s3_client.get_paginator('list_objects_v2')
-        pages = paginator.paginate(Bucket=BUCKET_NAME, Prefix=prefix)
-        cutoff_date = datetime.now() - timedelta(days=days_back)
-        for page in pages:
-            if 'Contents' not in page:
-                continue
-            
-            for obj in page['Contents']:
-                if obj['LastModified'].replace(tzinfo=None) >= cutoff_date:
-                    if obj['Key'].endswith('.json'):
-                        resp = s3_client.get_object(Bucket=BUCKET_NAME, Key=obj['Key'])
-                        data = json.loads(resp['Body'].read().decode('utf-8'))
-
-                    if isinstance(data, list):
-                        all_records.extend(data)
-                    else:
-                        all_records.append(data)
-                        
-        if not all_records:
-           return pd.DataFrame()
-       
-        df = pd.DataFrame(all_records)
-
-        # Normalize columns defensively
+        # Fetch the specific CSV file
+        resp = s3_client.get_object(Bucket=BUCKET_NAME, Key=file_key)
+        df = pd.read_csv(resp['Body'])
+        
+        # Standardize column names for your dashboard
         df.columns = df.columns.str.strip().str.lower()
-
-        if "timestamp_utc" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["timestamp_utc"], errors="coerce")
-        elif "timestamp" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        
+        # Handle the timestamp (Using Uganda time as per your CSV logic)
+        if 'timestamp_uganda' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp_uganda'])
         else:
-            return pd.DataFrame()
-
-        return df.dropna(subset=["timestamp"]).sort_values("timestamp")
+            df['timestamp'] = pd.to_datetime(df['timestamp_utc'])
+            
+        return df.sort_values("timestamp")
     
     except Exception as e:
-        logging.warning(f"S3 unavailable: {e}")
+        logging.warning(f"S3 CSV Load failed: {e}")
         return pd.DataFrame()
 
 def check_api_health():
@@ -252,7 +234,7 @@ def main():
     st.markdown("Real-time telemetry with AI-powered insights.")
 
 # 1. First, try to get data from AWS S3
-    df = load_data_from_s3(days_back=7)
+    df = load_data_from_s3()
 
     # 2. If S3 is empty, try to load the local file as a backup
     if df.empty:
@@ -264,15 +246,19 @@ def main():
         st.error("⚠️ No telemetry data available from S3 or local CSV.")
         return    
         
-    df = df.rename(columns={
-        "Timestamp": "timestamp",
-        "Temperature": "temperature_celsius",
-        "Humidity": "humidity_percent",
-        "Battery": "battery_voltage",
-        "Motion": "motion_counts",
-        "Signal": "rssi"
-    })
+    # df = df.rename(columns={
+    #     "Timestamp": "timestamp",
+    #     "Temperature": "temperature_celsius",
+    #     "Humidity": "humidity_percent",
+    #     "Battery": "battery_voltage",
+    #     "Motion": "motion_counts",
+    #     "Signal": "rssi"
+    # })
 
+    # If your CSV columns are already 'temperature_celsius', just ensure 'timestamp' exists
+    if 'timestamp' not in df.columns:
+        st.error("Timestamp column missing from S3 data")
+        
     # 4. If we found data, show the latest reading
     latest = df.iloc[-1] 
     
