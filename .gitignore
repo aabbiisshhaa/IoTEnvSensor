@@ -1,4 +1,4 @@
-# Streamlit secrets (CRITICAL: prevents key leaks)
+# Streamlit secrets to prevent key leaks
 .streamlit/secrets.toml
 
 # Python virtual environment
@@ -6,10 +6,6 @@ venv/
 .env
 __pycache__/
 *.pyc
-
-# Local data files (if you don't want your JSONs public)
-*.json
-!message_history.json  # (Optional: remove the ! if you want to hide this too)
 
 # Operating system files
 .DS_Store
