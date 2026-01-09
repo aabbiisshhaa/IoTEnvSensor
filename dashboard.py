@@ -25,7 +25,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # --- SETTINGS & STYLING ---
-st.set_page_config(page_title="Group C: Environment Sensor Dashboard", page_icon="🌡️", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="IoT Environmental Intelligence", page_icon="🌡️", layout="wide", initial_sidebar_state="expanded")
 
 apply_styles()
 
